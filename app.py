@@ -102,7 +102,7 @@ def _prepare_dataset() -> Tuple[pd.DataFrame, List[str]]:
 
     # Extract month from FEC_DEF for monthly analysis
     combined['MES'] = pd.to_datetime(combined['FEC_DEF'], errors='coerce').dt.month
-    # Mapeo manual de meses a nombres en español (no depende del locale del sistema)
+    # Mapeo manual de meses a nombres en español
     meses = {
         1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
         7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
@@ -163,6 +163,8 @@ _cases = _cases.merge(centroids[['DPTO_CNMBR', 'lon', 'lat']], left_on='Departam
 # Prepare GeoJSON from shapefile for choropleth
 gdf_map_geo = gdf_map.copy()
 gdf_map_geo = gdf_map_geo.to_crs(epsg=4326)
+# Simplificar geometrías para reducir memoria (tolerancia de ~100m)
+gdf_map_geo['geometry'] = gdf_map_geo['geometry'].simplify(tolerance=0.001)
 
 # Precalcular datos para optimización
 _yearly_counts = _cases.groupby('ANO').size().to_dict()
@@ -360,16 +362,18 @@ app.layout = dbc.Container([
 
 # Callbacks
 
-@lru_cache(maxsize=128)
+# Eliminar @lru_cache - causa overhead de serialización
 def _filter_data(year, dept):
-    """Cache filtered data to avoid redundant processing."""
+    """Filter data efficiently using boolean indexing."""
     if year == 'Todos':
-        dff = _cases.copy()
+        mask = pd.Series([True] * len(_cases))
     else:
-        dff = _cases[_cases['ANO'] == year].copy()
+        mask = _cases['ANO'] == year
+    
     if dept and dept != 'Todos':
-        dff = dff[dff['Departamento_residencia'] == dept]
-    return dff.to_json(date_format='iso', orient='split')
+        mask = mask & (_cases['Departamento_residencia'] == dept)
+    
+    return _cases[mask]
 
 @app.callback(
     Output('map', 'figure'),
@@ -385,9 +389,8 @@ def _filter_data(year, dept):
     Input('map-style', 'value')
 )
 def update(year, dept, map_style):
-    # Usar datos cacheados
-    dff_json = _filter_data(year, dept)
-    dff = pd.read_json(dff_json, orient='split')
+    # Filtrar datos eficientemente
+    dff = _filter_data(year, dept)
     
     total = len(dff)
 
@@ -405,10 +408,11 @@ def update(year, dept, map_style):
     trend_text = 'N/A'
     trend_color = 'text-secondary'
     if year and year != 'Todos' and year > _cases['ANO'].min():
-        prev_year_data = _cases[_cases['ANO'] == year - 1]
+        prev_year_mask = _cases['ANO'] == year - 1
         if dept and dept != 'Todos':
-            prev_year_data = prev_year_data[prev_year_data['Departamento_residencia'] == dept]
-        prev_total = len(prev_year_data)
+            prev_year_mask = prev_year_mask & (_cases['Departamento_residencia'] == dept)
+        prev_total = prev_year_mask.sum()
+        
         if prev_total > 0:
             change = total - prev_total
             pct_change = (change / prev_total) * 100
@@ -424,14 +428,14 @@ def update(year, dept, map_style):
 
     # Map - Crear figura según tipo de mapa seleccionado
     if map_style == 'choropleth':
-        # Mapa coroplético usando shapefile - optimizado
+        # Pre-agregar datos por departamento
         dept_counts = dff.groupby('Departamento_residencia', observed=True).size().reset_index(name='Casos')
         gdf_merged = gdf_map_geo.merge(dept_counts, left_on='DPTO_CNMBR', right_on='Departamento_residencia', how='left')
         gdf_merged['Casos'] = gdf_merged['Casos'].fillna(0).astype(int)
         
         fig_map = px.choropleth_map(
             gdf_merged,
-            geojson=gdf_merged.geometry,
+            geojson=gdf_merged.geometry.__geo_interface__,
             locations=gdf_merged.index,
             color='Casos',
             color_continuous_scale='Reds',
@@ -445,10 +449,18 @@ def update(year, dept, map_style):
         fig_map.update_layout(margin={'r':0,'t':0,'l':0,'b':0}, uirevision='constant')
         
     elif map_style == 'scatter':
-        # Puntos sobre shapefile - optimizado
+        # Limitar puntos para evitar sobrecarga - máximo 1000 puntos
+        dff_valid = dff.dropna(subset=['lon', 'lat'])
+        
+        if len(dff_valid) > 1000:
+            # Muestreo estratificado por departamento
+            dff_valid = dff_valid.groupby('Departamento_residencia', observed=True).apply(
+                lambda x: x.sample(n=min(len(x), max(1, 1000 // dff_valid['Departamento_residencia'].nunique())), random_state=42)
+            ).reset_index(drop=True)
+        
         fig_map = px.choropleth_map(
             gdf_map_geo,
-            geojson=gdf_map_geo.geometry,
+            geojson=gdf_map_geo.geometry.__geo_interface__,
             locations=gdf_map_geo.index,
             color_discrete_sequence=['#ffebee'],
             hover_name='DPTO_CNMBR',
@@ -457,32 +469,29 @@ def update(year, dept, map_style):
             height=500
         )
         
-        # Agregar puntos solo si hay datos con coordenadas válidas
-        if not dff.empty:
-            dff_valid = dff.dropna(subset=['lon', 'lat'])
-            if not dff_valid.empty:
-                scatter_trace = px.scatter_map(
-                    dff_valid,
-                    lon='lon',
-                    lat='lat',
-                    hover_data={'Municipio_residencia': True, 'FEC_DEF': True, 'lon': False, 'lat': False},
-                    color_discrete_sequence=['#c62828'],
-                    size_max=10
-                ).data[0]
-                fig_map.add_trace(scatter_trace)
+        if not dff_valid.empty:
+            scatter_trace = px.scatter_map(
+                dff_valid,
+                lon='lon',
+                lat='lat',
+                hover_data={'Municipio_residencia': True, 'FEC_DEF': True, 'lon': False, 'lat': False},
+                color_discrete_sequence=['#c62828'],
+                size_max=8
+            ).data[0]
+            fig_map.add_trace(scatter_trace)
         
         fig_map.update_geos(fitbounds="locations", visible=False)
         fig_map.update_layout(margin={'r':0,'t':0,'l':0,'b':0}, uirevision='constant')
         
     else:  # density
-        # Mapa de densidad - optimizado
+        # Pre-agregar datos
         dept_counts = dff.groupby('Departamento_residencia', observed=True).size().reset_index(name='Casos')
         gdf_merged = gdf_map_geo.merge(dept_counts, left_on='DPTO_CNMBR', right_on='Departamento_residencia', how='left')
         gdf_merged['Casos'] = gdf_merged['Casos'].fillna(0).astype(int)
         
         fig_map = px.choropleth_map(
             gdf_merged,
-            geojson=gdf_merged.geometry,
+            geojson=gdf_merged.geometry.__geo_interface__,
             locations=gdf_merged.index,
             color='Casos',
             color_continuous_scale=['#ffebee', '#ffcdd2', '#ef9a9a', '#e57373', '#ef5350', '#f44336', '#e53935', '#d32f2f', '#c62828', '#b71c1c'],
@@ -513,7 +522,7 @@ def update(year, dept, map_style):
                 showarrow=False, font=dict(color='#c62828', size=14)
             )
 
-    # Time Series Chart - Tendencia histórica (optimizado)
+    # Time Series Chart - Pre-agregado
     if dept == 'Todos':
         time_data = _cases.groupby('ANO', observed=True).size().reset_index(name='Casos')
     else:
@@ -543,7 +552,7 @@ def update(year, dept, map_style):
     fig_time.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#ecf0f1')
     fig_time.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#ecf0f1')
 
-    # Top 10 Departamentos (optimizado)
+    # Top 10 - Ya pre-agregado
     if dept == 'Todos':
         dept_counts = dff.groupby('Departamento_residencia', observed=True).size().reset_index(name='Casos')
         dept_counts = dept_counts.nlargest(10, 'Casos')
@@ -570,7 +579,6 @@ def update(year, dept, map_style):
         )
         fig_top_depts.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#ecf0f1')
     else:
-        # Si hay un departamento seleccionado, mostrar top municipios
         muni_counts = dff.groupby('Municipio_residencia', observed=True).size().reset_index(name='Casos')
         muni_counts = muni_counts.nlargest(10, 'Casos')
         
@@ -597,7 +605,7 @@ def update(year, dept, map_style):
         )
         fig_top_depts.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#ecf0f1')
 
-    # Distribución Mensual (optimizado)
+    # Distribución Mensual - Pre-agregado
     if 'MES' in dff.columns:
         monthly_counts = dff.groupby('MES', observed=True).size().reset_index(name='Casos')
         meses_nombres = {1: 'Ene', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'May', 6: 'Jun',
