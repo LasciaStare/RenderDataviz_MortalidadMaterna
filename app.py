@@ -102,12 +102,12 @@ def _prepare_dataset() -> Tuple[pd.DataFrame, List[str]]:
 
     # Extract month from FEC_DEF for monthly analysis
     combined['MES'] = pd.to_datetime(combined['FEC_DEF'], errors='coerce').dt.month
-    combined['MES_NOMBRE'] = pd.to_datetime(combined['FEC_DEF'], errors='coerce').dt.month_name(locale='es_ES')
-    # Fallback if locale not available
-    if combined['MES_NOMBRE'].isna().all():
-        meses = {1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
-                 7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'}
-        combined['MES_NOMBRE'] = combined['MES'].map(meses)
+    # Mapeo manual de meses a nombres en español (no depende del locale del sistema)
+    meses = {
+        1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
+        7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
+    }
+    combined['MES_NOMBRE'] = combined['MES'].map(meses)
 
     combined['Departamento_residencia'] = (
         combined['Departamento_residencia']
