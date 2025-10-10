@@ -194,6 +194,14 @@ elif not _cases.empty:
 else:
     notes_children = [html.Small('No hay datos disponibles para mostrar.')] 
 
+# Agregar siempre referencia a la fuente de datos (Sivigila)
+notes_children.append(
+    html.Div([
+        html.Small("Fuente de datos: "),
+        html.A("Portal de microdatos de Sivigila", href="https://portalsivigila.ins.gov.co/Paginas/Buscador.aspx", target="_blank", rel="noopener noreferrer")
+    ], className='mt-1')
+)
+
 app.layout = dbc.Container([
     # Header
     dbc.Row([
